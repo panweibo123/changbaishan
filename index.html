@@ -150,9 +150,13 @@ p { margin: 0; }
 .map-note { position: absolute; left: 12px; bottom: 10px; z-index: 6; font: 500 11.5px/1.5 var(--font-text); color: #f4efe5; background: rgba(20,28,32,.7); padding: 6px 10px; border-radius: 2px; max-width: calc(100% - 400px); }
 .map-legend { position: absolute; right: 12px; bottom: 10px; z-index: 6; display: flex; gap: 12px; font: 500 11.5px/1.5 var(--font-text); color: #f4efe5; background: rgba(20,28,32,.7); padding: 6px 10px; border-radius: 2px; }
 .map-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
-.map-fallback { position: absolute; inset: 0; z-index: 2; display: none; place-items: center; text-align: center; padding: 30px; color: #f4efe5; background: #1b252a url("assets/photos/crater.jpg") center/cover no-repeat; }
+.map-fallback { position: absolute; inset: 0; z-index: 2; display: none; place-items: center; text-align: center; padding: 24px 22px; color: #f4efe5; background: #1b252a url("assets/photos/crater.jpg") center/cover no-repeat; }
 .map-fallback.show { display: grid; }
-.map-fallback p { max-width: 46ch; font-size: 15px; line-height: 1.7; }
+.map-fallback::before { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(16,24,28,.74), rgba(16,24,28,.86)); }
+.map-fallback > div { position: relative; z-index: 1; display: grid; gap: 10px; justify-items: center; width: 100%; max-width: 40ch; }
+.map-fallback p { font-size: 15px; line-height: 1.7; margin: 0; color: #f4efe5; }
+.map-fallback .t-small { font-size: 13px; color: rgba(244,239,229,.78); }
+.map-fallback .chip { background: rgba(244,239,229,.94); border-color: transparent; color: #29251e; }
 
 /* map pins (real MapLibre markers) */
 .pin { display: flex; align-items: center; gap: 6px; padding: 5px 9px 5px 5px; background: rgba(244,239,229,.95); border: 1px solid rgba(41,37,30,.3); border-radius: 2px; color: var(--p-ink); font: 500 12px/1.2 var(--font-text); white-space: nowrap; cursor: pointer; box-shadow: 0 3px 10px rgba(0,0,0,.25); transition: transform .18s, background .18s; }
@@ -906,9 +910,23 @@ const REF_TILES = 'https://server.arcgisonline.com/ArcGIS/rest/services/Referenc
 const DEM_REMOTE = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
 const DEM_LOCAL = 'assets/tiles/dem/{z}/{x}/{y}.png';
 
-const map = (() => {
-  if (typeof maplibregl === 'undefined') return null;
-  const style = {
+let map = null;
+const mapFallbackEl = document.getElementById('mapFallback');
+const mapToolsEl = document.getElementById('mapTools');
+let fallbackBuilt = false;
+let markersBuilt = false;
+
+function webglVersion(){
+  try {
+    const c = document.createElement('canvas');
+    if (c.getContext('webgl2')) return 2;
+    if (c.getContext('webgl') || c.getContext('experimental-webgl')) return 1;
+  } catch (e) {}
+  return 0;
+}
+
+function mapStyle(){
+  return {
     version: 8,
     sources: {
       street: {type:'raster', tiles:[STREET_TILES], tileSize:256, maxzoom:16, attribution:'Esri World Street Map'},
@@ -923,36 +941,120 @@ const map = (() => {
       {id:'hill', type:'hillshade', source:'dem', paint:{'hillshade-exaggeration':0.34,
         'hillshade-shadow-color':'#1b2730','hillshade-highlight-color':'#fff4dd','hillshade-accent-color':'#22313d'}},
       {id:'ref', type:'raster', source:'ref', paint:{'raster-opacity':0.42}}
-    ],
-    terrain: {source:'dem', exaggeration:1.6}
+    ]
   };
-  try {
-    return new maplibregl.Map({
-      container:'map3d', style,
-      center:VIEWS.crater.center, zoom:VIEWS.crater.zoom, pitch:VIEWS.crater.pitch, bearing:VIEWS.crater.bearing,
-      antialias:true, attributionControl:false, maxPitch:75,
-      transformRequest:(url) => {
-        if (url.indexOf('assets/tiles/dem/') < 0) return undefined;
-        const m = url.match(/\/dem\/(\d+)\/(\d+)\/(\d+)\.png/);
-        if (!m) return undefined;
-        const key = m[1] + '/' + m[2] + '/' + m[3];
-        if (location.protocol === 'file:' || !LOCAL_DEM.has(key)) {
-          return {url: DEM_REMOTE.replace('{z}', m[1]).replace('{x}', m[2]).replace('{y}', m[3])};
-        }
-        return undefined;
-      }
-    });
-  } catch (e) { return null; }
-})();
+}
 
-if (!map) {
-  document.getElementById('mapFallback').classList.add('show');
-  document.getElementById('mapTools').style.display = 'none';
-} else {
-  map.addControl(new maplibregl.NavigationControl({showCompass:true, visualizePitch:true}), 'bottom-right');
-  map.addControl(new maplibregl.ScaleControl({maxWidth:100, unit:'metric'}), 'bottom-left');
-  map.on('error', e => { if (e && e.error && /WebGL|context/i.test(e.error.message || '')) {
-    document.getElementById('mapFallback').classList.add('show'); } });
+function createMap(){
+  const touch = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const base = {
+    container:'map3d',
+    center:VIEWS.crater.center, zoom:VIEWS.crater.zoom, pitch:VIEWS.crater.pitch, bearing:VIEWS.crater.bearing,
+    attributionControl:false, maxPitch:75, failIfMajorPerformanceCaveat:false,
+    transformRequest:(url) => {
+      if (url.indexOf('assets/tiles/dem/') < 0) return undefined;
+      const m = url.match(/\/dem\/(\d+)\/(\d+)\/(\d+)\.png/);
+      if (!m) return undefined;
+      const key = m[1] + '/' + m[2] + '/' + m[3];
+      if (location.protocol === 'file:' || !LOCAL_DEM.has(key)) {
+        return {url: DEM_REMOTE.replace('{z}', m[1]).replace('{x}', m[2]).replace('{y}', m[3])};
+      }
+      return undefined;
+    }
+  };
+  const attempts = [
+    Object.assign({}, base, {style:mapStyle(), antialias:!touch}),
+    Object.assign({}, base, {style:mapStyle(), antialias:false, fadeDuration:0}),
+    Object.assign({}, base, {style:mapStyle(), antialias:false, fadeDuration:0, preserveDrawingBuffer:true})
+  ];
+  let reason = '';
+  for (let i = 0; i < attempts.length; i++) {
+    try { return new maplibregl.Map(attempts[i]); }
+    catch (err) { reason = (err && err.message) || String(err); }
+  }
+  window.__mapErr = reason;
+  return null;
+}
+
+function showMapFallback(reason){
+  mapFallbackEl.classList.add('show');
+  mapToolsEl.style.display = 'none';
+  mapFallbackEl.innerHTML =
+    '<div><p>' + reason + '</p>' +
+    '<p class="t-small" style="margin-top:10px">地点详情仍可在下面的标签里逐个打开。</p>' +
+    '<button class="chip" id="mapRetry" style="margin-top:16px">再试一次 3D 地形</button></div>';
+  const retry = document.getElementById('mapRetry');
+  if (retry) retry.addEventListener('click', () => {
+    retry.textContent = '正在重试…';
+    initMap();
+  });
+  if (fallbackBuilt) return;
+  fallbackBuilt = true;
+  const list = document.createElement('div');
+  list.className = 'chips';
+  list.style.marginTop = '18px';
+  list.innerHTML = PINS.map(p => '<button class="chip" data-id="' + p.id + '">' + p.short + '</button>').join('');
+  list.addEventListener('click', e => { const b = e.target.closest('.chip'); if (b) openPin(b.dataset.id); });
+  document.querySelector('#map .map-stage').appendChild(list);
+}
+
+function loadScript(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureLib(){
+  if (typeof maplibregl !== 'undefined') return true;
+  const urls = [
+    'assets/vendor/maplibre-gl.js',
+    'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js',
+    'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js'
+  ];
+  for (let i = 0; i < urls.length; i++) {
+    try { await loadScript(urls[i]); } catch (e) {}
+    if (typeof maplibregl !== 'undefined') return true;
+  }
+  return false;
+}
+
+async function initMap(){
+  const ok = await ensureLib();
+  if (!ok) { showMapFallback('地图程序没能加载（可能是网络拦截）。'); return; }
+  if (!webglVersion()) {
+    showMapFallback('这个浏览器没有开启 WebGL，所以画不出 3D 地形。换 Safari 或 Chrome 打开试试。');
+    return;
+  }
+  if (map) { try { map.remove(); } catch (e) {} map = null; }
+  map = createMap();
+  if (!map) {
+    showMapFallback('3D 地形在这台设备上没起来：' + (window.__mapErr || '未知原因'));
+    return;
+  }
+  mapFallbackEl.classList.remove('show');
+  mapToolsEl.style.display = '';
+  try {
+    map.addControl(new maplibregl.NavigationControl({showCompass:true, visualizePitch:true}), 'bottom-right');
+    map.addControl(new maplibregl.ScaleControl({maxWidth:100, unit:'metric'}), 'bottom-left');
+  } catch (e) {}
+  map.on('load', () => {
+    try { map.setTerrain({source:'dem', exaggeration:1.6}); } catch (e) {}
+    if (!markersBuilt) { markersBuilt = true; buildMarkers(); }
+    setTimeout(() => { try { map.resize(); } catch (e) {} }, 220);
+  });
+  map.on('webglcontextlost', () => showMapFallback('显卡渲染上下文丢失了，刷新页面即可恢复。'));
+  map.on('error', e => {
+    if (e && e.error && /WebGL|context|Failed to initialize/i.test(e.error.message || '')) {
+      showMapFallback('3D 渲染出错了：' + e.error.message);
+    }
+  });
+  if (typeof tools !== 'undefined') {
+    const satBtn = tools.querySelector('[data-style="sat"]');
+    if (satBtn) satBtn.classList.add('on');
+  }
 }
 
 /* markers */
@@ -1028,7 +1130,6 @@ tools.addEventListener('click', e => {
     tools.querySelectorAll('[data-style]').forEach(x => x.classList.toggle('on', x === b));
   }
 });
-if (map) tools.querySelector('[data-style="sat"]').classList.add('on');
 
 /* filters */
 let groupFilter = 'all';
@@ -1111,18 +1212,7 @@ document.getElementById('postGrid').innerHTML = KEY_POSTS.map(p =>
   '<div class="post span-6"><div class="post__n">' + p[0] + ' 赞</div><div class="post__t">' + p[1] + '</div><div class="post__d">' + p[2] + '</div></div>').join('');
 
 renderRoutes('all');
-if (map) map.on('load', buildMarkers);
-else {
-  /* no 3D map: still let each place open from a plain list */
-  document.getElementById('mapFallback').innerHTML =
-    '<p>3D 地形需要联网与 WebGL。地点详情可在下方列表中查看。</p>';
-  const list = document.createElement('div');
-  list.className = 'chips';
-  list.style.marginTop = '18px';
-  list.innerHTML = PINS.map(p => '<button class="chip" data-id="' + p.id + '">' + p.short + '</button>').join('');
-  list.addEventListener('click', e => { const b = e.target.closest('.chip'); if (b) openPin(b.dataset.id); });
-  document.querySelector('#map .map-stage').appendChild(list);
-}
+initMap();
 </script>
 
 <script type="module" src="assets/system.js"></script>
